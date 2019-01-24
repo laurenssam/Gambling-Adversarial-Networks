@@ -187,6 +187,8 @@ def define_D(input_nc, ndf, netD, n_layers_D=3, norm='batch', init_type='normal'
 
     if netD == 'basic':  # default PatchGAN classifier
         net = NLayerDiscriminator(input_nc, ndf, n_layers=3, norm_layer=norm_layer)
+    elif netD == 'basic2':  # default PatchGAN classifier
+        net = NLayerDiscriminator2(input_nc, ndf, n_layers=3, norm_layer=norm_layer)
     elif netD == 'n_layers':  # more options
         net = NLayerDiscriminator(input_nc, ndf, n_layers_D, norm_layer=norm_layer)
     elif netD == 'pixel':     # classify if each pixel is real or fake
@@ -575,6 +577,52 @@ class NLayerDiscriminator(nn.Module):
     def forward(self, input):
         """Standard forward."""
         return self.model(input)
+
+class NLayerDiscriminator2(nn.Module):
+    """Defines a PatchGAN discriminator"""
+
+    def __init__(self, input_nc, ndf=64, n_layers=3, norm_layer=nn.BatchNorm2d):
+        """Construct a PatchGAN discriminator
+
+        Parameters:
+            input_nc (int)  -- the number of channels in input images
+            ndf (int)       -- the number of filters in the last conv layer
+            n_layers (int)  -- the number of conv layers in the discriminator
+            norm_layer      -- normalization layer
+        """
+        super(NLayerDiscriminator2, self).__init__()
+        if type(norm_layer) == functools.partial:  # no need to use bias as BatchNorm2d has affine parameters
+            use_bias = norm_layer.func != nn.BatchNorm2d
+        else:
+            use_bias = norm_layer != nn.BatchNorm2d
+        kw = 4
+        padw = 1
+        self.conv1 = nn.Conv2d(input_nc, ndf, kernel_size=kw, stride=2, padding=padw)
+        self.pool1 = nn.MaxPool2d(2, stride=2)
+        self.relu1 =  nn.LeakyReLU(0.2, True)
+        self.conv2 = nn.Conv2d(ndf, ndf * 2, kernel_size=kw, stride=2, padding=padw, bias=use_bias) 
+        self.norm2 = norm_layer(ndf * 2)
+        self.relu2 =  nn.LeakyReLU(0.2, True)
+        self.conv3 = nn.Conv2d(ndf * 2, ndf * 4, kernel_size=kw, stride=2, padding=padw, bias=use_bias)
+
+        self.norm3 = norm_layer(ndf * 4)
+        self.relu3 =  nn.LeakyReLU(0.2, True)
+        self.conv4 = nn.Conv2d(ndf * 4, ndf * 8, kernel_size=kw, stride=1, padding=padw, bias=use_bias)
+        self.norm4 = norm_layer(ndf * 8)
+        self.relu4 =  nn.LeakyReLU(0.2, True)
+        self.conv5 = nn.Conv2d(ndf * 8, 1, kernel_size=kw, stride=1, padding=padw)
+
+
+    def forward(self, input, emb=False):
+        feat1 = self.pool1(self.conv1(input))
+        feat2 = self.pool1(self.conv2(self.relu1(feat1)))
+        feat3 = self.pool1(self.conv3(self.relu2(self.norm2(feat2))))
+        if emb == True:
+            return feat3
+        feat4 = self.conv4(self.relu3(self.norm3(feat3)))
+        feat5 = self.conv5(self.relu4(self.norm4(feat4)))
+        """Standard forward."""
+        return feat5
 
 
 class PixelDiscriminator(nn.Module):
