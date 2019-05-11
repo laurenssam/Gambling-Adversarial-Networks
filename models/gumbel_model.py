@@ -14,7 +14,7 @@ from .focal_loss import FocalLoss2d
 
 
 
-class Pix2PixModel(BaseModel):
+class GumbelModel(BaseModel):
     """ This class implements the pix2pix model, for learning a mapping from input images to output images given paired data.
 
     The model training requires '--dataset_mode aligned' dataset.
@@ -44,7 +44,7 @@ class Pix2PixModel(BaseModel):
         if is_train:
             parser.set_defaults(pool_size=0, gan_mode='vanilla')
             parser.add_argument('--lambda_GAN', type=float, default=1.0, help='weight for L1 loss')
-            parser.add_argument('--alpha', type=float, default=0.25, help='weight for the class unbalancing')
+            parser.add_argument('--alpha', type=float, default=0.8, help='weight for the class unbalancing')
             parser.add_argument('--gamma', type=float, default=2., help='scale for the focal loss')
             parser.add_argument('--weighting', type=str, default="mean", help='type of class weighting (mf/class')
             # parser.add_argument('--num_D', type=int, default=1, help='Number of discriminators')
@@ -91,13 +91,10 @@ class Pix2PixModel(BaseModel):
             self.weight = torch.tensor([2.5, 24.1, 4.9, 209.9, 151.4, 86.8, 498.4, 186.2, 6.1200, 113.6, 17.2, 82.9, 632.9, 16.9, 446.,411.5, 450.2, 1158.9, 274.6]).to(self.device)
 
             # self.criterionCE = FocalLoss2d(weight=self.weight**(opt.alpha), gamma=opt.gamma)
-            self.criterionCE = torch.nn.CrossEntropyLoss(weight=self.weight**(opt.alpha), ignore_index=self.ignore)  
-            # self.criterionCE = FocalLoss2d(weight=self.weight**(0.25), gamma = 2)
-          
+            self.criterionCE = torch.nn.CrossEntropyLoss(weight=self.weight**(opt.alpha), ignore_index=self.ignore)            
             self.criterionGAN = networks.GANLoss(opt.gan_mode).to(self.device)
             # initialize optimizers; schedulers will be automatically created by function <BaseModel.setup>.
             self.optimizer_G = torch.optim.Adam(self.netG.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999), weight_decay=5e-4)
-
             self.optimizers.append(self.optimizer_G)
 
             ## Training schedule
@@ -112,19 +109,11 @@ class Pix2PixModel(BaseModel):
             # Initialisation
             self.loss_G_GAN = 0
             self.loss_G_CE = 0
-            if opt.pretrained == "full":
-                state_dict = torch.load("latest_net_G_full.pth", map_location=self.device)
-                self.netG.load_state_dict(state_dict)
-            elif opt.pretrained == "split":
-                state_dict = torch.load("latest_net_G_split.pth", map_location=self.device)
-                self.netG.load_state_dict(state_dict)
-            else:
-                print("Starting from scratch")
-            # state_dict_opt = torch.load("optimizer.pth")
-            # self.optimizer_G.load_state_dict(state_dict_opt)
-            # self.optimizer_G.param_groups[0]["lr"] = opt.lr
-            # print(self.optimizer_G)
-
+            state_dict = torch.load("latest_net_G.pth", map_location=self.device)
+            self.netG.load_state_dict(state_dict)
+            if self.pretrain: 
+                self.netG.eval()
+                print("pretraining D: evaluation mode")
             self.softmax = torch.nn.Softmax(dim=1)
             self.sigmoid = torch.nn.Sigmoid()
             self.accuracies = []
@@ -150,7 +139,18 @@ class Pix2PixModel(BaseModel):
         """Run forward pass; called by both functions <optimize_parameters> and <test>."""
         self.fake_B = self.netG(self.real_A)  # G(A) ## Convolution output N X 19 X 512 X 512
         valid_region_mask = (self.real_B != self.ignore).unsqueeze(1).expand(self.fake_B.shape).float() ## N X 19 X 512 X 512 0 for where real is ignore label
-        self.input_discr_fake = self.softmax(self.fake_B) * valid_region_mask ## Elementwise multiplication: Zeroing out the ignore label
+        self.fake_B_temp = self.fake_B.permute(0, 2, 3, 1)
+        fake_shape = self.fake_B_temp.shape
+        self.fake_B_gumbel = torch.nn.functional.gumbel_softmax(self.fake_B_temp.reshape(-1, fake_shape[-1]), tau=0.5, hard=True).reshape(fake_shape)
+        # print(self.fake_B_gumbel.shape)
+        self.fake_B_gumbel = self.fake_B_gumbel.permute(0, 3, 1, 2)
+        # print(self.fake_B[0, :, 0, 0])
+        # print(self.fake_B_gumbel[0, :, 0, 0])
+        # print(self.fake_B[0, :, 100, 150])
+        # print(self.fake_B_gumbel[0, :, 100, 150])
+        # print(self.fake_B[0, :, 5, 200])
+        # print(self.fake_B_gumbel[0, :, 5, 200])
+        self.input_discr_fake = self.fake_B_gumbel * valid_region_mask ## Elementwise multiplication: Zeroing out the ignore label
         self.mean_max.append(torch.mean(torch.max(self.softmax(self.fake_B), dim=1)[0]).data)
 
     
@@ -290,6 +290,6 @@ class Pix2PixModel(BaseModel):
         plt.title("mean of the max prediction")
         plt.savefig("checkpoints/" + self.opt.name + "/mean_max.png")
         plt.close()
-        self.fake_B_output = torch.argmax(self.fake_B.clone(), dim=1)   ## N X 512 x 512
+        self.fake_B_output = torch.argmax(self.fake_B_gumbel.clone(), dim=1)   ## N X 512 x 512
         self.fake_B_output[self.real_B == self.ignore] = self.real_B[self.real_B == self.ignore]
 

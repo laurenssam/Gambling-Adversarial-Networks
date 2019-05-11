@@ -4,8 +4,12 @@ import sys
 import ntpath
 import time
 from . import util, html
+from PIL import Image
 from subprocess import Popen, PIPE
 from scipy.misc import imresize
+import matplotlib.pyplot as plt
+import torch
+import cityscapes
 
 if sys.version_info[0] == 2:
     VisdomExceptionBase = Exception
@@ -28,6 +32,7 @@ def save_images(webpage, visuals, image_path, aspect_ratio=1.0, width=256):
     image_dir = webpage.get_image_dir()
     short_path = ntpath.basename(image_path[0])
     name = os.path.splitext(short_path)[0]
+    name = image_path
 
     webpage.add_header(name)
     ims, txts, links = [], [], []
@@ -101,7 +106,7 @@ class Visualizer():
         print('Command: %s' % cmd)
         Popen(cmd, shell=True, stdout=PIPE, stderr=PIPE)
 
-    def display_current_results(self, visuals, epoch, save_result):
+    def display_current_results(self, visuals, epoch, save_result, iteration, trainer):
         """Display current results on visdom; save current results to an HTML file.
 
         Parameters:
@@ -124,10 +129,20 @@ class Visualizer():
                 label_html_row = ''
                 images = []
                 idx = 0
+                bool_bet = False
                 for label, image in visuals.items():
-                    image_numpy = util.tensor2im(image)
+                    if label == "bet_map":
+                        bool_bet = True
+                        bet_map = np.flipud(image.data[0].cpu().numpy())
+                    elif label == "prediction":
+                        pass
+                    elif label == "ce_map" or  label == "bet_map2":
+                        pass
+                    else:   
+                        image_numpy = util.tensor2im(image)
+                        images.append(image_numpy.transpose([2, 0, 1]))
                     label_html_row += '<td>%s</td>' % label
-                    images.append(image_numpy.transpose([2, 0, 1]))
+
                     idx += 1
                     if idx % ncols == 0:
                         label_html += '<tr>%s</tr>' % label_html_row
@@ -145,6 +160,8 @@ class Visualizer():
                     label_html = '<table>%s</table>' % label_html
                     self.vis.text(table_css + label_html, win=self.display_id + 2,
                                   opts=dict(title=title + ' labels'))
+                    if bool_bet:
+                        self.vis.heatmap(bet_map, opts=dict(colormap='Greys'), win=self.display_id + 3)
                 except VisdomExceptionBase:
                     self.create_visdom_connections()
 
@@ -162,10 +179,62 @@ class Visualizer():
         if self.use_html and (save_result or not self.saved):  # save images to an HTML file if they haven't been saved.
             self.saved = True
             # save images to the disk
+            images_PIL = []
+            count_imgs = 0
             for label, image in visuals.items():
-                image_numpy = util.tensor2im(image)
-                img_path = os.path.join(self.img_dir, 'epoch%.3d_%s.png' % (epoch, label))
-                util.save_image(image_numpy, img_path)
+                if label == "prediction":
+                    image_numpy = image.data[0].cpu().numpy()
+                    fig, ax = plt.subplots(nrows=5, ncols=4, figsize=(15,15))
+                    counter = 0
+                    img_path = os.path.join(self.img_dir, 'epoch%.3d_iter%.3d_%s_prediction.png' % (epoch, iteration + 1, trainer))
+                    for row in ax:
+                        for col in row:
+                            if counter == 19:
+                                col.set_visible(False)
+                            else:
+                                temp = col.imshow(image_numpy[counter], cmap = 'hot')
+                                col.set_title(cityscapes.classes[counter])
+                                col.axis("off")
+                                counter += 1
+                    fig.colorbar(temp)
+                    plt.savefig(img_path, bbox_inches="tight", dpi=200)
+                    plt.close()
+                elif label == "bet_map" or label == "bet_map2":
+                    image_numpy = image.data[0].cpu().numpy()
+                    sizes = image_numpy.shape
+                    fig = plt.figure()
+                    fig.set_size_inches(1. * sizes[0]/sizes[1], 1, forward=False)
+                    ax = plt.Axes(fig, [0., 0., 1., 1.])
+                    ax.set_axis_off()
+                    fig.add_axes(ax)
+                    ax.imshow(image_numpy, cmap = 'gray', vmin=0, vmax=1)
+                    plt.savefig(self.img_dir + "temp.png", dpi=sizes[0])
+                    plt.close()
+                    images_PIL.append(Image.open(self.img_dir + "temp.png"))
+                    os.remove(self.img_dir + "temp.png")
+                elif label == "ce_map":
+                    image_numpy = image.data[0].cpu().numpy() 
+                    sizes = image_numpy.shape
+                    fig = plt.figure()
+                    fig.set_size_inches(1. * sizes[0]/sizes[1], 1, forward=False)
+                    ax = plt.Axes(fig, [0., 0., 1., 1.])
+                    ax.set_axis_off()
+                    fig.add_axes(ax)
+                    ax.imshow(image_numpy, cmap = 'gray', vmin=0, vmax=1)
+                    plt.savefig(self.img_dir + "temp2.png", dpi=sizes[0])
+                    plt.close()
+                    images_PIL.append(Image.open(self.img_dir + "temp2.png"))
+                    os.remove(self.img_dir + "temp2.png")
+                    # img_path = os.path.join(self.img_dir, 'epoch%.3d_%s_iter%.3d_%s.png' % (epoch, label, iteration + 1, trainer))
+                    # plt.imshow(image_numpy, cmap = 'gray')
+                    # plt.savefig(img_path)
+                    # plt.close()
+                else:
+                    image_numpy = util.tensor2im(image)
+                    images_PIL.append(Image.fromarray(image_numpy).convert("RGB"))
+                    count_imgs += 1
+            img_path = os.path.join(self.img_dir, 'epoch%.3d_iter%.3d_%s.png' % (epoch, iteration + 1, trainer))
+            util.save_images(images_PIL, img_path)
 
             # update website
             webpage = html.HTML(self.web_dir, 'Experiment name = %s' % self.name, refresh=1)
@@ -173,13 +242,13 @@ class Visualizer():
                 webpage.add_header('epoch [%d]' % n)
                 ims, txts, links = [], [], []
 
-                for label, image_numpy in visuals.items():
-                    image_numpy = util.tensor2im(image)
-                    img_path = 'epoch%.3d_%s.png' % (n, label)
-                    ims.append(img_path)
-                    txts.append(label)
-                    links.append(img_path)
-                webpage.add_images(ims, txts, links, width=self.win_size)
+                
+                image_numpy = util.tensor2im(image)
+                img_path = 'epoch%.3d_iter%.3d_%s.png' % (epoch, iteration + 1, trainer)
+                ims.append(img_path)
+                txts.append("Images")
+                links.append(img_path)
+                webpage.add_images(ims, txts, links, width=self.win_size * count_imgs)
             webpage.save()
 
     def plot_current_losses(self, epoch, counter_ratio, losses):

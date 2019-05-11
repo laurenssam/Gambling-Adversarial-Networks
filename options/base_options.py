@@ -20,30 +20,32 @@ class BaseOptions():
     def initialize(self, parser):
         """Define the common options that are used in both training and test."""
         # basic parameters
-        parser.add_argument('--dataroot', required=True, help='path to images (should have subfolders trainA, trainB, valA, valB, etc)')
+        parser.add_argument('--dataroot', type=str, default='/media/deepstorage01/datasets_external/facades', help='path to images (should have subfolders trainA, trainB, valA, valB, etc)')
         parser.add_argument('--name', type=str, default='experiment_name', help='name of the experiment. It decides where to store samples and models')
         parser.add_argument('--gpu_ids', type=str, default='0', help='gpu ids: e.g. 0  0,1,2, 0,2. use -1 for CPU')
         parser.add_argument('--checkpoints_dir', type=str, default='./checkpoints', help='models are saved here')
         # model parameters
         parser.add_argument('--model', type=str, default='pix2pix', help='chooses which model to use. [cycle_gan | pix2pix | test | colorization|EL]')
         parser.add_argument('--input_nc', type=int, default=3, help='# of input image channels: 3 for RGB and 1 for grayscale')
-        parser.add_argument('--output_nc', type=int, default=3, help='# of output image channels: 3 for RGB and 1 for grayscale')
-        parser.add_argument('--ngf', type=int, default=64, help='# of gen filters in the last conv layer')
+        parser.add_argument('--output_nc', type=int, default=19, help='# of output image channels: 3 for RGB and 1 for grayscale')
+        parser.add_argument('--ngf', type=int, default=128, help='# of gen filters in the last conv layer')
         parser.add_argument('--ndf', type=int, default=64, help='# of discrim filters in the first conv layer')
         parser.add_argument('--netD', type=str, default='basic', help='specify discriminator architecture [basic | n_layers | pixel]. The basic model is a 70x70 PatchGAN. n_layers allows you to specify the layers in the discriminator')
-        parser.add_argument('--netG', type=str, default='unet_256', help='specify generator architecture [resnet_9blocks | resnet_6blocks | unet_256 | unet_128]')
+        parser.add_argument('--netG', type=str, default='unet_512', help='specify generator architecture [resnet_9blocks | resnet_6blocks | unet_256 | unet_128]')
         parser.add_argument('--n_layers_D', type=int, default=3, help='only used if netD==n_layers')
         parser.add_argument('--output_layer', type=int, default=3, help='Which output convolution layer to be used, Note: Must be smaller or equal then n_layers_D')
-        parser.add_argument('--pretrain_D', type=int, default=200, help="number of pretraining the discriminator")
+        parser.add_argument('--pretrain_D', type=int, default=500, help="number of pretraining the discriminator")
         parser.add_argument('--pretrain_G', type=int, default=300, help="number of pretraining the generator")
-        parser.add_argument('--G_train', type=int, default=300, help="number of pretraining the discriminator")
-        parser.add_argument('--D_train', type=int, default=200, help="number of pretraining the generator")
-        parser.add_argument('--norm', type=str, default='instance', help='instance normalization or batch normalization [instance | batch | none]')
+        parser.add_argument('--G_train', type=int, default=50, help="number of pretraining the discriminator")
+        parser.add_argument('--D_train', type=int, default=100, help="number of pretraining the generator")
+        parser.add_argument('--norm', type=str, default='batch', help='instance normalization or batch normalization [instance | batch | none]')
         parser.add_argument('--init_type', type=str, default='normal', help='network initialization [normal | xavier | kaiming | orthogonal]')
         parser.add_argument('--init_gain', type=float, default=0.02, help='scaling factor for normal, xavier and orthogonal.')
         parser.add_argument('--no_dropout', action='store_true', help='no dropout for the generator')
+        parser.add_argument('--num_D', type=int, default=1, help='Number of discriminators.')
+
         # dataset parameters
-        parser.add_argument('--dataset_mode', type=str, default='unaligned', help='chooses how datasets are loaded. [unaligned | aligned | single | colorization]')
+        parser.add_argument('--dataset_mode', type=str, default='aligned', help='chooses how datasets are loaded. [unaligned | aligned | single | colorization]')
         parser.add_argument('--direction', type=str, default='AtoB', help='AtoB or BtoA')
         parser.add_argument('--serial_batches', action='store_true', help='if true, takes images in order to make batches, otherwise takes them randomly')
         parser.add_argument('--num_threads', default=4, type=int, help='# threads for loading data')
@@ -59,6 +61,12 @@ class BaseOptions():
         parser.add_argument('--load_iter', type=int, default='0', help='which iteration to load? if load_iter > 0, the code will load models by iter_[load_iter]; otherwise, the code will load models by [epoch]')
         parser.add_argument('--verbose', action='store_true', help='if specified, print more debugging information')
         parser.add_argument('--suffix', default='', type=str, help='customized suffix: opt.name = opt.name + suffix: e.g., {model}_{netG}_size{load_size}')
+        parser.add_argument('--gt', type=float, default=0.0, help='Coeffienct that model sees groundtruth')
+        parser.add_argument('--pretrained', type=str, default="full", help='Continue the adversarial training from either scratch/split/full')
+        parser.add_argument('--class_name', type=str, default=None, help='Continue the adversarial training from either scratch/split/full')
+        parser.add_argument('--evaluate_gambler', type=int, default=0, help='Continue the adversarial training from either scratch/split/full')
+        parser.add_argument('--weight_gambler', type=float, default=4.0, help='Continue the adversarial training from either scratch/split/full')
+
         self.initialized = True
         return parser
 
@@ -107,10 +115,16 @@ class BaseOptions():
         message += '----------------- End -------------------'
         print(message)
 
-        # save to the disk
-        expr_dir = os.path.join(opt.checkpoints_dir, opt.name)
-        util.mkdirs(expr_dir)
-        file_name = os.path.join(expr_dir, 'opt.txt')
+        if opt.test == "train":
+            opt.name = opt.name + "_" + str(opt.pretrained) + "_lrG" + str(opt.lr) + "_lrD" + str(opt.lr_D) + "_D" + str(opt.num_D) + "_L" + str(opt.n_layers_D) + "_G-D" + str(opt.G_train) + "-" + str(opt.D_train) + "_ndf" + str(opt.ndf) + "_lamb" + str(opt.lambda_GAN) + "_GT" + str(opt.gt)
+            opt.name = opt.name.replace(".", "")
+            # save to the disk
+            expr_dir = os.path.join(opt.checkpoints_dir, opt.name)
+            util.mkdirs(expr_dir)
+            file_name = os.path.join(expr_dir, 'opt.txt')
+        else:
+            expr_dir = os.path.join(opt.checkpoints_dir, opt.name)
+            file_name = os.path.join(expr_dir, 'opt_eval.txt')
         with open(file_name, 'wt') as opt_file:
             opt_file.write(message)
             opt_file.write('\n')

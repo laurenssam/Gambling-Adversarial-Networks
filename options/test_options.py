@@ -18,8 +18,16 @@ class TestOptions(BaseOptions):
         parser.add_argument('--num_test', type=int, default=50, help='how many test images to run')
         # evaluation
         parser.add_argument('--evaluate', type=int, default=1, help="whether to evaluate")
-        parser.add_argument('--model_eval', type=str, default='seg', help='train, val, test, etc')
-        parser.add_argument('--name_eval', type=str, default='facades_photo_to_labels', help='train, val, test, etc')
+        parser.add_argument('--model_eval', type=str, default='seg', help='')
+        parser.add_argument('--name_eval', type=str, default='facades_segmentation', help='train, val, test, etc')
+        parser.add_argument('--suffix2', type=str, default='', help='suffix for saving directory')
+        parser.add_argument('--class_id', type=str, default='train', help='class to be evaluated')
+        parser.add_argument('--test', type=str, default="test", help='for checking mode')
+        parser.add_argument('--gambler', type=int, default=0, help='for checking mode')
+        parser.add_argument('--structure', type=int, default=0, help='for checking mode')
+        parser.add_argument('--argmax', type=int, default=0, help='for checking mode')
+        parser.add_argument('--visualize_features', type=int, default=0, help='for checking mode')
+
 
         # rewrite devalue values
         parser.set_defaults(model='test')
