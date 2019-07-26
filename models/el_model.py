@@ -42,6 +42,8 @@ class ELModel(BaseModel):
             parser.add_argument('--alpha', type=float, default=0.25, help='weight for the class unbalancing')
             parser.add_argument('--weighting', type=str, default="mean", help='type of class weighting (mf/class')
             parser.add_argument('--loss_D', type=str, default="bce", help='type of loss for discriminator (bce/emb)')
+            parser.add_argument('--start_adv', type=int, default=0, help='epoch number that adversarial training starts')
+
 
         return parser
 
@@ -63,7 +65,7 @@ class ELModel(BaseModel):
             self.model_names = ['G']
         # define networks (both generator and discriminator)
         self.netG = networks.define_G(opt.input_nc, opt.output_nc, opt.ngf, opt.netG, opt.norm,
-                                      not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids)
+                                      not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids).to(self.device)
         if self.isTrain:  # define a discriminator; conditional GANs need to take both input and output images; Therefore, #channels for D is input_nc + output_nc
             for i in range(1, self.opt.num_D + 1):
                 temp = networks.define_D(opt.input_nc + opt.output_nc, opt.ndf, opt.netD,
@@ -73,7 +75,7 @@ class ELModel(BaseModel):
                 setattr(self, 'loss_D' + str(i) +'_fake', 0)
                 setattr(self, 'loss_D' + str(i) +'_real', 0)
                 # self.optimizers.append(torch.optim.SGD(temp.parameters(), lr=opt.lr_D, momentum=0.9))
-                self.optimizers.append(torch.optim.Adam(temp.parameters(), lr=opt.lr_D, betas=(opt.beta1, 0.999), weight_decay=1e-4))
+                self.optimizers.append(torch.optim.Adam(temp.parameters(), lr=opt.lr_D, betas=(opt.beta1, 0.999), weight_decay=1e-5))
                 self.model_names.extend(['D' + str(i)])
 
             self.downsample = torch.nn.AvgPool2d(3, stride=2, padding=[1, 1], count_include_pad=False)
@@ -96,8 +98,13 @@ class ELModel(BaseModel):
             self.criterionGAN = networks.GANLoss(opt.gan_mode).to(self.device)
             self.ignore = 255
             # define loss functions
+            if self.opt.dataset == "voc":
+                self.weight = torch.tensor([1.59, 78.8, 89., 81.72, 113.67, 144., 57.9, 39.8, 25.62, 72.51, 133.7, 96., 27.4, 83.63, 67.7,  11.2, 137.6, 119.2, 80.3, 59., 111.]).to(self.device)
+            elif self.opt.dataset == "camvid":
+                self.weight = torch.tensor([0.588, 0.510, 2.6966, 0.45, 1.17, 0.770, 2.47, 2.52, 1.01, 3.237, 4.131]).to(self.device)
+            else:
+                self.weight = torch.tensor([2.5, 24.1, 4.9, 209.9, 151.4, 86.8, 498.4, 186.2, 6.1200, 113.6, 17.2, 82.9, 632.9, 16.9, 446.,411.5, 450.2, 1158.9, 274.6]).to(self.device)
 
-            self.weight = torch.tensor([2.5, 24.1, 4.9, 209.9, 151.4, 86.8, 498.4, 186.2, 6.1200, 113.6, 17.2, 82.9, 632.9, 16.9, 446.,411.5, 450.2, 1158.9, 274.6]).to(self.device)
             self.criterionCE = torch.nn.CrossEntropyLoss(weight=self.weight**(opt.alpha), ignore_index=self.ignore)            
             self.criterionEL = torch.nn.MSELoss()
 
@@ -106,13 +113,15 @@ class ELModel(BaseModel):
             self.optimizers.append(self.optimizer_G)
 
             if opt.pretrained == "full":
-                state_dict = torch.load("latest_net_G_full.pth", map_location=self.device)
+                filename = "latest_net_G_full_" + self.opt.dataset + "_" + self.opt.netG + ".pth" 
+                state_dict = torch.load(filename, map_location=self.device)
                 self.netG.load_state_dict(state_dict)
-            elif opt.pretrained == "split":
-                state_dict = torch.load("latest_net_G_split.pth", map_location=self.device)
+                print(filename + "loaded")
+            elif opt.pretrained == "early":
+                filename = "latest_net_G_early_" + self.opt.dataset + "_" + self.opt.netG + ".pth" 
+                state_dict = torch.load(filename, map_location=self.device)
                 self.netG.load_state_dict(state_dict)
-            else:
-                print("Starting from scratch")
+
             self.softmax = torch.nn.Softmax(dim=1)
 
             # Statistics of discriminator
@@ -127,13 +136,19 @@ class ELModel(BaseModel):
             self.epoch = 0
             self.norms_G = []
             self.norms_D = []
+            self.mean_max = []
+            self.losses_real = []
+            self.losses_fake = []
+            self.embedding_losses = []
+            self.CE_losses = []
+            self.iteration_D = 0
+            self.iteration_G = 0
+
             # self.pretrain_D = 0
 
     def to_one_hot(self, labels, C):
         one_hot = torch.FloatTensor(labels.size(0), C, labels.size(2), labels.size(3)).zero_()
         target = one_hot.scatter_(1, labels.cpu(), 1)
-        # print(test[(test == labels.cpu())].flatten())
-        # print(labels[(test == labels.cpu())].flatten())
         return target.to(self.device).float()
 
     def set_input(self, input):
@@ -156,15 +171,16 @@ class ELModel(BaseModel):
         # valid_region_mask = (self.real_B != self.ignore).unsqueeze(1).expand_as(self.fake_B).float()
         # self.input_discr_fake = self.softmax(self.fake_B.clone()) * valid_region_mask
         self.fake_B = self.netG(self.real_A)  # G(A) # Forward pass
-        self.mask = (self.real_B != self.ignore).unsqueeze(dim=1).expand(self.fake_B.shape).float() # mask for ignore class, zeroes out the ignore class    
-        # max_indices = self.to_one_hot(torch.argmax(self.fake_B.detach(), dim=1).unsqueeze(dim=1), 19) * 5 # N x 512 X 512 --> N X 1 X 512 X 512 --> N X 19 X 512 X 512 --> * 100
-        # self.input_discr_fake = self.softmax(self.fake_B.clone() + max_indices) * self.mask # fake * masking
-        self.input_discr_fake = self.to_one_hot(torch.argmax(self.fake_B.detach(), dim=1).unsqueeze(dim=1), 19) * self.mask - (1-self.mask)
+        if self.netG.training:
+            self.mask = (self.real_B != self.ignore).unsqueeze(dim=1).expand(self.fake_B.shape).float() # mask for ignore class, zeroes out the ignore class    
+            # max_indices = self.to_one_hot(torch.argmax(self.fake_B.detach(), dim=1).unsqueeze(dim=1), 19) * 5 # N x 512 X 512 --> N X 1 X 512 X 512 --> N X 19 X 512 X 512 --> * 100
+            # self.input_discr_fake = self.softmax(self.fake_B.clone() + max_indices) * self.mask # fake * masking
+            self.input_discr_fake = self.softmax(self.fake_B) * self.mask - (1-self.mask)
 
-        self.real_B_one_hot_temp = self.real_B.clone() ## cloning the real image
-        self.real_B_one_hot_temp[self.real_B_one_hot_temp == self.ignore] = 0 ## 
-        self.real_B_one_hot = self.to_one_hot(self.real_B_one_hot_temp.unsqueeze(dim=1), 19)
-        self.real_B_one_hot = self.real_B_one_hot * self.mask - (1-self.mask)
+            self.real_B_one_hot_temp = self.real_B.clone() ## cloning the real image
+            self.real_B_one_hot_temp[self.real_B_one_hot_temp == self.ignore] = 0 ## 
+            self.real_B_one_hot = self.to_one_hot(self.real_B_one_hot_temp.unsqueeze(dim=1), self.opt.output_nc)
+            self.real_B_one_hot = self.real_B_one_hot * self.mask - (1-self.mask)
 
 
     def backward_D(self):
@@ -191,31 +207,29 @@ class ELModel(BaseModel):
 
             fake_AB = torch.cat((input_rgb, input_fake), 1)  # we use conditional GANs; we need to feed both input and output to the discriminator
             pred_fake = discriminator(fake_AB.detach())
-            correct_predictions = (self.sigmoid(pred_fake) < 0.5).float().sum()
+            # correct_predictions = (self.sigmoid(pred_fake) < 0.5).float().sum()
             loss_fake = self.criterionGAN(pred_fake, False)
             setattr(self, 'loss_D' + str(i) + '_fake', loss_fake)
 
             # Real
             real_AB = torch.cat((input_rgb, input_real), 1)
             pred_real = discriminator(real_AB)
-            correct_predictions += (self.sigmoid(pred_real) > 0.5).float().sum()
+            # correct_predictions += (self.sigmoid(pred_real) > 0.5).float().sum()
             loss_real = self.criterionGAN(pred_real, True)
             setattr(self, 'loss_D' + str(i) + '_real', loss_real)
-            self.accuracies.append(float(correct_predictions/(np.prod(pred_fake.shape) * 2)))
+            # self.accuracies.append(float(correct_predictions/(np.prod(pred_fake.shape) * 2)))
+
 
             # combine loss and calculate gradients
             self.loss_D = (loss_fake + loss_real) * 0.5
             self.loss_D.backward()
             self.optimizers[i-1].step()
+            if self.iteration_D % 50:
+                self.losses_real.append(loss_real.item())
+                self.losses_fake.append(loss_fake.item())
             if i != self.opt.num_D:
                 input_real, input_fake, input_rgb = self.downsample(input_real), self.downsample(input_fake), self.downsample(input_rgb)
-        total_norm = 0
-        for p in self.netD1.parameters():
-            param_norm = p.grad.data.norm(2)
-            total_norm += param_norm.item() ** 2
-        total_norm = total_norm ** (1. / 2)
-        self.norms_D.append(float(total_norm))
-
+        self.iteration_D += 1
 
     def backward_G(self):
         """Calculate embedding loss and L1 loss for the generator"""
@@ -229,7 +243,7 @@ class ELModel(BaseModel):
 
         for i in range(1, self.opt.num_D + 1):
             discriminator = getattr(self, 'netD' + str(i))
-            self.set_requires_grad(discriminator, False)  # enable backprop for D
+            self.set_requires_grad(discriminator, False)  # disable backprop for D
 
             fake_AB = torch.cat((input_rgb, input_fake), 1)
             pred_fake = discriminator(fake_AB, emb=True)
@@ -237,23 +251,22 @@ class ELModel(BaseModel):
             with torch.no_grad():
                 real_AB = torch.cat((input_rgb, input_real), 1)
                 pred_real = discriminator(real_AB, emb=True)
-           
             for j, emb_fake in enumerate(pred_fake):
-                self.loss_EL += (self.criterionEL(emb_fake, pred_real[j].detach()) * self.opt.lambda_GAN * (1/emb_fake.shape[1]) *  (1/self.opt.num_D))
-            
+                self.loss_EL += (self.criterionEL(emb_fake, pred_real[j].detach()) * self.opt.lambda_GAN * (1/self.opt.num_D))
             if i != self.opt.num_D:
                 input_real, input_fake, input_rgb = self.downsample(input_real), self.downsample(input_fake), self.downsample(input_rgb)
-        self.loss_CE = self.criterionCE(self.fake_B, self.real_B) 
-        self.loss_G = self.loss_EL + self.loss_CE
+        self.loss_CE = self.criterionCE(self.fake_B, self.real_B)
+        if self.epoch > self.opt.start_adv:
+            self.loss_G = self.loss_EL + self.loss_CE
+        else:
+            self.loss_G = self.loss_CE
         self.optimizer_G.zero_grad()        # set G's gradients to zero
         self.loss_G.backward()
         self.optimizer_G.step()             # udpate G's weights
-        total_norm = 0
-        for p in self.netG.parameters():
-            param_norm = p.grad.data.norm(2)
-            total_norm += param_norm.item() ** 2
-        total_norm = total_norm ** (1. / 2)
-        self.norms_G.append(float(total_norm))
+        if self.iteration_G % 50 == 0:
+            self.embedding_losses.append(self.loss_EL.item())
+            self.CE_losses.append(self.loss_CE.item())
+        self.iteration_G += 1
 
 
     def optimize_parameters(self):
@@ -280,22 +293,20 @@ class ELModel(BaseModel):
                     self.count_D = 0
                     self.count_G = 0
                     print("Finished schedule D: training mode")
-        plt.plot(self.accuracies)
-        plt.title("Accuracy discriminator")
-        plt.savefig("checkpoints/" + self.opt.name + "/accuracy.png")
-        plt.close()
-
-        plt.plot(self.norms_D)
-        plt.title("Gradient norm D")
-        plt.savefig("checkpoints/" + self.opt.name + "/norm_D.png")
-        plt.close()
-
-        plt.plot(self.norms_G)
-        plt.title("Gradient norm G")
-        plt.savefig("checkpoints/" + self.opt.name + "/norm_G.png")
-        plt.close()
-        self.fake_B_output = torch.argmax(self.fake_B.clone(), dim=1)   ## N X 512 x 512
+        self.fake_B_output = torch.argmax(self.fake_B.detach(), dim=1)   ## N X 512 x 512
         self.fake_B_output[self.real_B == self.ignore] = self.real_B[self.real_B == self.ignore]
+        if (self.iteration_G + self.iteration_D) %  200:
+            plt.plot(self.losses_fake)
+            plt.plot(self.losses_real)
+            plt.legend(["Loss_fake", "Loss_real"])
+            plt.savefig("checkpoints/" + self.opt.name + "/train_loss_D.png")
+            plt.close()
+
+            plt.plot(self.embedding_losses)
+            plt.plot(self.CE_losses)
+            plt.legend(["emb_loss", "CE_loss"])
+            plt.savefig("checkpoints/" + self.opt.name + "/train_loss_G.png")
+            plt.close()
 
 
 

@@ -8,11 +8,31 @@ import torch.nn.functional as F
 import torch.utils.model_zoo as model_zoo
 import re
 import numpy as np
+from torchvision import models
+
 from torch.nn.utils import spectral_norm
+from .layers import *
+try:
+    from torch.hub import load_state_dict_from_url
+except ImportError:
+    from torch.utils.model_zoo import load_url as load_state_dict_from_url
 
 
 
+class PolyLR(object):
+    def __init__(self, optimizer, curr_iter, max_iter, lr_decay):
+        self.max_iter = float(max_iter)
+        self.init_lr_groups = []
+        for p in optimizer.param_groups:
+            self.init_lr_groups.append(p['lr'])
+        self.param_groups = optimizer.param_groups
+        self.curr_iter = curr_iter
+        self.lr_decay = lr_decay
 
+    def step(self):
+        self.curr_iter += 1
+        for idx, p in enumerate(self.param_groups):
+            p['lr'] = self.init_lr_groups[idx] * (1 - self.curr_iter / self.max_iter) ** self.lr_decay
 ###############################################################################
 # Helper Functions
 ###############################################################################
@@ -54,6 +74,9 @@ def get_scheduler(optimizer, opt):
             lr_l = 1.0 - max(0, epoch + opt.epoch_count - opt.niter) / float(opt.niter_decay + 1)
             return lr_l
         scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda_rule)
+    elif opt.lr_policy == "poly":
+        print(opt.niter + opt.niter_decay)
+        scheduler = PolyLR(optimizer, 0, opt.niter + opt.niter_decay + 1, 0.9)
     elif opt.lr_policy == 'step':
         scheduler = lr_scheduler.StepLR(optimizer, step_size=opt.lr_decay_iters, gamma=0.1)
     elif opt.lr_policy == 'plateau':
@@ -157,6 +180,11 @@ def define_G(input_nc, output_nc, ngf, netG, norm='batch', use_dropout=False, in
         net = UnetGenerator(input_nc, output_nc, 8, ngf, norm_layer=norm_layer, use_dropout=use_dropout)
     elif netG == 'unet_512':
         net = UnetGenerator(input_nc, output_nc, 9, ngf, norm_layer=norm_layer, use_dropout=use_dropout)
+    elif netG == "tira":
+        net = FCDenseNet57(in_channels=input_nc, n_classes=output_nc)
+    elif netG == "psp":
+        net = PSPNet(output_nc).cuda()
+        return net
     elif netG == "global":
         net = netG = GlobalGenerator(input_nc, output_nc, ngf)  
         print(net)
@@ -209,8 +237,14 @@ def define_D(input_nc, ndf, netD, n_layers_D=3, norm='batch', init_type='normal'
         net = DenseNet()
     elif netD == "unet":
         # net = ResnetGenerator(input_nc, output_nc, ngf, norm_layer=norm_layer, use_dropout=False, n_blocks=6)
-        net = UnetGenerator(input_nc, output_nc, 5, ndf, norm_layer=norm_layer, use_dropout=True)
-        print(net)
+        net = UnetGenerator(input_nc, output_nc, 6, ndf, norm_layer=norm_layer, use_dropout=True, pool=False)
+        # print(net)
+    elif netD == "psp":
+        net = PSPNet(output_nc, Gam=True, input_c=input_nc)
+        return net
+    elif netD == "tira":
+        net = FCDenseNet57(in_channels=input_nc, n_classes=output_nc)
+
     else:
         raise NotImplementedError('Discriminator model name [%s] is not recognized' % net)
     return init_net(net, init_type, init_gain, gpu_ids)
@@ -446,15 +480,11 @@ class ResnetBlock(nn.Module):
         out = x + self.conv_block(x)  # add skip connections
         return out
 
-outputs = []
-
-def hook(module, input, output):
-    outputs.append(output)
 
 class UnetGenerator(nn.Module):
     """Create a Unet-based generator"""
 
-    def __init__(self, input_nc, output_nc, num_downs, ngf=64, norm_layer=nn.BatchNorm2d, use_dropout=False, kernel_size=4, dilation=1):
+    def __init__(self, input_nc, output_nc, num_downs, ngf=64, norm_layer=nn.BatchNorm2d, use_dropout=False, kernel_size=4, pool=False):
         """Construct a Unet generator
         Parameters:
             input_nc (int)  -- the number of channels in input images
@@ -469,14 +499,16 @@ class UnetGenerator(nn.Module):
         """
         super(UnetGenerator, self).__init__()
         # construct unet structure
-        unet_block = UnetSkipConnectionBlock(ngf * 8, ngf * 8, input_nc=None, submodule=None, norm_layer=norm_layer, innermost=True, dilation=dilation)  # add the innermost layer
+        unet_block = UnetSkipConnectionBlock(ngf * 8, ngf * 8, input_nc=None, submodule=None, norm_layer=norm_layer, innermost=True, pool=pool)  # add the innermost layer
         for i in range(num_downs - 5):          # add intermediate layers with ngf * 8 filters
-            unet_block = UnetSkipConnectionBlock(ngf * 8, ngf * 8, input_nc=None, submodule=unet_block, norm_layer=norm_layer, use_dropout=use_dropout, dilation=dilation)
+            unet_block = UnetSkipConnectionBlock(ngf * 8, ngf * 8, input_nc=None, submodule=unet_block, norm_layer=norm_layer, use_dropout=use_dropout, pool=pool)
         # gradually reduce the number of filters from ngf * 8 to ngf
-        unet_block = UnetSkipConnectionBlock(ngf * 4, ngf * 8, input_nc=None, submodule=unet_block, norm_layer=norm_layer, dilation=dilation)
-        unet_block = UnetSkipConnectionBlock(ngf * 2, ngf * 4, input_nc=None, submodule=unet_block, norm_layer=norm_layer, dilation=dilation)
-        unet_block = UnetSkipConnectionBlock(ngf, ngf * 2, input_nc=None, submodule=unet_block, norm_layer=norm_layer, dilation=dilation)
-        self.model = UnetSkipConnectionBlock(output_nc, ngf, input_nc=input_nc, submodule=unet_block, outermost=True, dilation=dilation)  # add the outermost layer
+        unet_block = UnetSkipConnectionBlock(ngf * 4, ngf * 8, input_nc=None, submodule=unet_block, norm_layer=norm_layer, pool=pool)
+        unet_block = UnetSkipConnectionBlock(ngf * 2, ngf * 4, input_nc=None, submodule=unet_block, norm_layer=norm_layer, pool=pool)
+        unet_block = UnetSkipConnectionBlock(ngf, ngf * 2, input_nc=None, submodule=unet_block, norm_layer=norm_layer, pool=pool, emb=True)
+        self.model = UnetSkipConnectionBlock(output_nc, ngf, input_nc=input_nc, submodule=unet_block, outermost=True, pool=pool)  # add the outermost layer
+        self.features = []
+        self.counter = 0
 
     def forward(self, input):
         """Standard forward"""
@@ -490,7 +522,7 @@ class UnetSkipConnectionBlock(nn.Module):
     """
 
     def __init__(self, outer_nc, inner_nc, input_nc=None,
-                 submodule=None, outermost=False, innermost=False, norm_layer=nn.BatchNorm2d, use_dropout=False, kernel_size=4, dilation=1):
+                 submodule=None, outermost=False, innermost=False, norm_layer=nn.BatchNorm2d, use_dropout=False, kernel_size=4, pool=False, emb=False):
         """Construct a Unet submodule with skip connections.
 
         Parameters:
@@ -505,16 +537,19 @@ class UnetSkipConnectionBlock(nn.Module):
         """
         super(UnetSkipConnectionBlock, self).__init__()
         self.outermost = outermost
+        self.emb = emb
         if type(norm_layer) == functools.partial:
             use_bias = norm_layer.func == nn.InstanceNorm2d
         else:
             use_bias = norm_layer == nn.InstanceNorm2d
         if input_nc is None:
             input_nc = outer_nc
-        use_bias=True
+        use_bias = True
+        if pool:
+            maxpool = nn.MaxPool2d(3, stride=1, padding=1)
         downconv = nn.Conv2d(input_nc, inner_nc, kernel_size=kernel_size,
-                             stride=2, padding=1, bias=use_bias, dilation=dilation)
-        downrelu = nn.LeakyReLU(0.2, True)
+                             stride=2, padding=1, bias=use_bias)
+        downrelu = nn.LeakyReLU(0.2)
         downnorm = norm_layer(inner_nc)
         uprelu = nn.ReLU(True)
         upnorm = norm_layer(outer_nc)
@@ -522,22 +557,25 @@ class UnetSkipConnectionBlock(nn.Module):
         if outermost:
             upconv = nn.ConvTranspose2d(inner_nc * 2, outer_nc,
                                         kernel_size=kernel_size, stride=2,
-                                        padding=1, dilation=dilation)
+                                        padding=1)
             down = [downconv]
             up = [uprelu, upconv]
             model = down + [submodule] + up
         elif innermost:
             upconv = nn.ConvTranspose2d(inner_nc, outer_nc,
                                         kernel_size=kernel_size, stride=2,
-                                        padding=1, bias=use_bias, dilation=dilation)
+                                        padding=1, bias=use_bias)
             down = [downrelu, downconv]
             up = [uprelu, upconv, upnorm]
             model = down + up
         else:
             upconv = nn.ConvTranspose2d(inner_nc * 2, outer_nc,
                                         kernel_size=kernel_size, stride=2,
-                                        padding=1, bias=use_bias, dilation=dilation)
-            down = [downrelu, downconv, downnorm]
+                                        padding=1, bias=use_bias)
+            if pool:
+                down = [downrelu, downconv, maxpool, downnorm]
+            else:
+                down = [downrelu, downconv, downnorm]
             up = [uprelu, upconv, upnorm]
 
             if use_dropout:
@@ -549,10 +587,12 @@ class UnetSkipConnectionBlock(nn.Module):
 
     def forward(self, x):
         if self.outermost:
-            return self.model(x)
+            output = self.model(x)
+            return output
         else:   # add skip connections
             output = self.model(x)
-            return torch.cat([x, output], 1)
+            features = torch.cat([x, output], 1)
+            return features
 
 
 class NLayerDiscriminator(nn.Module):
@@ -620,9 +660,66 @@ class NLayerDiscriminator(nn.Module):
                 x = layer(x)
                 if isinstance(layer, nn.Conv2d):
                     features.append(x)
+            del features[-1]
             return features
         """Standard forward."""
         return self.model(input)
+
+
+class Mapper(nn.Module):
+    """Defines a PatchGAN discriminator"""
+
+    def __init__(self, input_nc, output_nc, norm_layer=nn.BatchNorm2d):
+        """Construct a PatchGAN discriminator
+
+        Parameters:
+            input_nc (int)  -- the number of channels in input images
+            ndf (int)       -- the number of filters in the last conv layer
+            n_layers (int)  -- the number of conv layers in the discriminator
+            norm_layer      -- normalization layer
+        """
+        super(Mapper, self).__init__()
+
+        self.conv1 = nn.Conv2d(input_nc, output_nc, kernel_size=3, padding=1)
+        self.norm1 = norm_layer(output_nc)
+        self.relu1 =  nn.ReLU(True)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.norm1(x)
+        x = self.relu1(x)
+        return x
+
+class OutMapper(nn.Module):
+    """Defines a PatchGAN discriminator"""
+
+    def __init__(self, input_nc, output_nc, norm_layer=nn.BatchNorm2d):
+        """Construct a PatchGAN discriminator
+
+        Parameters:
+            input_nc (int)  -- the number of channels in input images
+            ndf (int)       -- the number of filters in the last conv layer
+            n_layers (int)  -- the number of conv layers in the discriminator
+            norm_layer      -- normalization layer
+        """
+        super(OutMapper, self).__init__()
+        if type(norm_layer) == functools.partial:  # no need to use bias as BatchNorm2d has affine parameters
+            use_bias = norm_layer.func != nn.BatchNorm2d
+        else:
+            use_bias = norm_layer != nn.BatchNorm2d
+        kw = 3
+        padw = 1
+        self.norm1 = norm_layer(input_nc)
+        self.relu1 =  nn.ReLU(True)
+        self.conv1 = nn.Conv2d(input_nc, output_nc, kernel_size=3, padding=1)
+        
+
+
+    def forward(self, x):
+        x = self.norm1(x)
+        x = self.relu1(x)
+        x = self.conv1(x)
+        return x
 
 # class NLayerDiscriminator2(nn.Module):
 #     """Defines a PatchGAN discriminator"""
@@ -887,3 +984,243 @@ class GlobalGenerator(nn.Module):
             
     def forward(self, input):
         return self.model(input) 
+
+class FCDenseNet(nn.Module):
+    def __init__(self, in_channels=3, down_blocks=(5,5,5,5,5),
+                 up_blocks=(5,5,5,5,5), bottleneck_layers=5,
+                 growth_rate=16, out_chans_first_conv=48, n_classes=12):
+        super().__init__()
+        self.down_blocks = down_blocks
+        self.up_blocks = up_blocks
+        cur_channels_count = 0
+        skip_connection_channel_counts = []
+
+        ## First Convolution ##
+
+        self.add_module('firstconv', nn.Conv2d(in_channels=in_channels,
+                  out_channels=out_chans_first_conv, kernel_size=3,
+                  stride=1, padding=1, bias=True))
+        cur_channels_count = out_chans_first_conv
+
+        #####################
+        # Downsampling path #
+        #####################
+
+        self.denseBlocksDown = nn.ModuleList([])
+        self.transDownBlocks = nn.ModuleList([])
+        for i in range(len(down_blocks)):
+            self.denseBlocksDown.append(
+                DenseBlock(cur_channels_count, growth_rate, down_blocks[i]))
+            cur_channels_count += (growth_rate*down_blocks[i])
+            skip_connection_channel_counts.insert(0,cur_channels_count)
+            self.transDownBlocks.append(TransitionDown(cur_channels_count))
+
+        #####################
+        #     Bottleneck    #
+        #####################
+
+        self.add_module('bottleneck',Bottleneck(cur_channels_count,
+                                     growth_rate, bottleneck_layers))
+        prev_block_channels = growth_rate*bottleneck_layers
+        cur_channels_count += prev_block_channels
+
+        #######################
+        #   Upsampling path   #
+        #######################
+
+        self.transUpBlocks = nn.ModuleList([])
+        self.denseBlocksUp = nn.ModuleList([])
+        for i in range(len(up_blocks)-1):
+            self.transUpBlocks.append(TransitionUp(prev_block_channels, prev_block_channels))
+            cur_channels_count = prev_block_channels + skip_connection_channel_counts[i]
+
+            self.denseBlocksUp.append(DenseBlock(
+                cur_channels_count, growth_rate, up_blocks[i],
+                    upsample=True))
+            prev_block_channels = growth_rate*up_blocks[i]
+            cur_channels_count += prev_block_channels
+
+        ## Final DenseBlock ##
+
+        self.transUpBlocks.append(TransitionUp(
+            prev_block_channels, prev_block_channels))
+        cur_channels_count = prev_block_channels + skip_connection_channel_counts[-1]
+
+        self.denseBlocksUp.append(DenseBlock(
+            cur_channels_count, growth_rate, up_blocks[-1],
+                upsample=False))
+        cur_channels_count += growth_rate*up_blocks[-1]
+
+        ## Softmax ##
+
+        self.finalConv = nn.Conv2d(in_channels=cur_channels_count,
+               out_channels=n_classes, kernel_size=1, stride=1,
+                   padding=0, bias=True)
+        # self.softmax = nn.LogSoftmax(dim=1)
+
+    def forward(self, x):
+        out = self.firstconv(x)
+
+        skip_connections = []
+        for i in range(len(self.down_blocks)):
+            out = self.denseBlocksDown[i](out)
+            skip_connections.append(out)
+            out = self.transDownBlocks[i](out)
+
+        out = self.bottleneck(out)
+        for i in range(len(self.up_blocks)):
+            skip = skip_connections.pop()
+            out = self.transUpBlocks[i](out, skip)
+            out = self.denseBlocksUp[i](out)
+
+        out = self.finalConv(out)
+        # out = self.softmax(out)
+        return out
+
+
+def FCDenseNet57(in_channels=3, n_classes=1):
+    return FCDenseNet(
+        in_channels=in_channels, down_blocks=(4, 4, 4, 4, 4),
+        up_blocks=(4, 4, 4, 4, 4), bottleneck_layers=4,
+        growth_rate=12, out_chans_first_conv=48, n_classes=n_classes)
+
+
+def FCDenseNet67(n_classes):
+    return FCDenseNet(
+        in_channels=3, down_blocks=(5, 5, 5, 5, 5),
+        up_blocks=(5, 5, 5, 5, 5), bottleneck_layers=5,
+        growth_rate=16, out_chans_first_conv=48, n_classes=n_classes)
+
+
+def FCDenseNet103(n_classes):
+    return FCDenseNet(
+        in_channels=3, down_blocks=(4,5,7,10,12),
+        up_blocks=(12,10,7,5,4), bottleneck_layers=15,
+        growth_rate=16, out_chans_first_conv=48, n_classes=n_classes)
+
+class _EncoderBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, dropout=False):
+        super(_EncoderBlock, self).__init__()
+        layers = [
+            nn.Conv2d(in_channels, out_channels, kernel_size=3),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        ]
+        if dropout:
+            layers.append(nn.Dropout())
+        layers.append(nn.MaxPool2d(kernel_size=2, stride=2))
+        self.encode = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.encode(x)
+
+
+class _DecoderBlock(nn.Module):
+    def __init__(self, in_channels, middle_channels, out_channels):
+        super(_DecoderBlock, self).__init__()
+        self.decode = nn.Sequential(
+            nn.Conv2d(in_channels, middle_channels, kernel_size=3),
+            nn.BatchNorm2d(middle_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(middle_channels, middle_channels, kernel_size=3),
+            nn.BatchNorm2d(middle_channels),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(middle_channels, out_channels, kernel_size=2, stride=2),
+        )
+
+    def forward(self, x):
+        return self.decode(x)
+
+class _PyramidPoolingModule(nn.Module):
+    def __init__(self, in_dim, reduction_dim, setting):
+        super(_PyramidPoolingModule, self).__init__()
+        self.features = []
+        for s in setting:
+            self.features.append(nn.Sequential(
+                nn.AdaptiveAvgPool2d(s),
+                nn.Conv2d(in_dim, reduction_dim, kernel_size=1, bias=False),
+                nn.BatchNorm2d(reduction_dim, momentum=.95),
+                nn.ReLU(inplace=True)
+            ))
+        self.features = nn.ModuleList(self.features)
+
+    def forward(self, x):
+        x_size = x.size()
+        out = [x]
+        for f in self.features:
+            out.append(F.interpolate(f(x), x_size[2:], mode='bilinear', align_corners=False))
+        out = torch.cat(out, 1)
+        return out
+
+
+class PSPNet(nn.Module):
+    def __init__(self, num_classes, pretrained=True, use_aux=False, Gam=False, input_c=0):
+        super(PSPNet, self).__init__()
+        self.use_aux = use_aux
+        resnet = models.resnet101(pretrained=True).train()
+        # if pretrained:
+        #     path = 'https://download.pytorch.org/models/resnet101-5d3b4d8f.pth'
+        #     state_dict = load_state_dict_from_url(path, progress=True)
+        #     resnet.load_state_dict(state_dict)
+        #     print("Pretrained PSPNet")
+        if Gam:
+            conv1 = nn.Conv2d(input_c, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
+            self.layer0 = nn.Sequential(conv1, resnet.bn1, resnet.relu, resnet.maxpool)
+        else:
+            self.layer0 = nn.Sequential(resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool)
+        self.layer1, self.layer2, self.layer3, self.layer4 = resnet.layer1, resnet.layer2, resnet.layer3, resnet.layer4
+
+        for n, m in self.layer3.named_modules():
+            if 'conv2' in n:
+                m.dilation, m.padding, m.stride = (2, 2), (2, 2), (1, 1)
+            elif 'downsample.0' in n:
+                m.stride = (1, 1)
+        for n, m in self.layer4.named_modules():
+            if 'conv2' in n:
+                m.dilation, m.padding, m.stride = (4, 4), (4, 4), (1, 1)
+            elif 'downsample.0' in n:
+                m.stride = (1, 1)
+
+        self.ppm = _PyramidPoolingModule(2048, 512, (1, 2, 3, 6))
+        self.final = nn.Sequential(
+            nn.Conv2d(4096, 512, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(512, momentum=.95),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.1),
+            nn.Conv2d(512, num_classes, kernel_size=1)
+        )
+        self.initialize_weights(self.ppm, self.final)
+
+        if use_aux:
+            self.aux_logits = nn.Conv2d(1024, num_classes, kernel_size=1)
+
+    def initialize_weights(self, *models):
+        for model in models:
+            for module in model.modules():
+                if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear):
+                    nn.init.kaiming_normal(module.weight)
+                    if module.bias is not None:
+                        module.bias.data.zero_()
+                elif isinstance(module, nn.BatchNorm2d):
+                    module.weight.data.fill_(1)
+                    module.bias.data.zero_()
+
+    def forward(self, x):
+        x_size = x.size()
+        x = self.layer0(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        if self.training and self.use_aux:
+            aux = self.aux_logits(x)
+        x = self.layer4(x)
+        x = self.ppm(x)
+        x = self.final(x)
+        if self.training and self.use_aux:
+            return F.interpolate(x, x_size[2:], mode='bilinear'), F.interpolate(aux, x_size[2:], mode='bilinear')
+        return F.interpolate(x, x_size[2:], mode='bilinear', align_corners=False)
+
+

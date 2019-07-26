@@ -28,7 +28,9 @@ def tensor2im(input_image, imtype=np.uint8):
             image_numpy = (image_numpy - np.min(image_numpy))/(np.max(image_numpy)-np.min(image_numpy))
         if image_numpy.shape[0] == 1:  # grayscale to RGB
             image_numpy = np.tile(image_numpy, (3, 1, 1))
-        image_numpy = (np.transpose(image_numpy, (1, 2, 0)) + 1) / 2.0 * 255.0  # post-processing: tranpose and scaling
+        # image_numpy = (np.transpose(image_numpy, (1, 2, 0)) + 1) / 2.0 * 255.0  # post-processing: tranpose and scaling
+        # print(np.amin(image_numpy), np.amax(image_numpy))
+        image_numpy = (np.transpose(image_numpy, (1, 2, 0))) * 255#/np.amax(image_numpy) * 255.0  # post-processing: tranpose and scaling
     else:  # if it is a numpy array, do nothing
         image_numpy = np.array(ninput_image)
     return image_numpy.astype(imtype)

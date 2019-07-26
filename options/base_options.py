@@ -66,6 +66,14 @@ class BaseOptions():
         parser.add_argument('--class_name', type=str, default=None, help='Continue the adversarial training from either scratch/split/full')
         parser.add_argument('--evaluate_gambler', type=int, default=0, help='Continue the adversarial training from either scratch/split/full')
         parser.add_argument('--weight_gambler', type=float, default=4.0, help='Continue the adversarial training from either scratch/split/full')
+        parser.add_argument('--thickness', type=int, default=2, help='train on the ce map')
+        parser.add_argument('--matching', type=int, default=0, help='train on the ce map')
+        parser.add_argument('--load', type=int, default=0, help='train on the ce map')
+        parser.add_argument('--dataset', type=str, default="voc", help='train on the ce map')
+        parser.add_argument('--adv', type=int, default=0, help='train on the ce map')
+
+
+
 
         self.initialized = True
         return parser
@@ -116,13 +124,15 @@ class BaseOptions():
         print(message)
 
         if opt.test == "train":
-            opt.name = opt.name + "_" + str(opt.pretrained) + "_lrG" + str(opt.lr) + "_lrD" + str(opt.lr_D) + "_D" + str(opt.num_D) + "_L" + str(opt.n_layers_D) + "_G-D" + str(opt.G_train) + "-" + str(opt.D_train) + "_ndf" + str(opt.ndf) + "_lamb" + str(opt.lambda_GAN) + "_GT" + str(opt.gt)
+            opt.name = opt.dataset + "/" + opt.model + "/" + opt.name + "_"
+            opt.name = opt.name + str(opt.pretrained) + "_lrG" + str(opt.lr) + "_lrD" + str(opt.lr_D) + "_D" + str(opt.num_D) + "_L" + str(opt.n_layers_D) + "_G-D" + str(opt.G_train) + "-" + str(opt.D_train) + "_ndf" + str(opt.ndf) + "_lamb" + str(opt.lambda_GAN) + "_GT" + str(opt.gt)
             opt.name = opt.name.replace(".", "")
             # save to the disk
             expr_dir = os.path.join(opt.checkpoints_dir, opt.name)
             util.mkdirs(expr_dir)
             file_name = os.path.join(expr_dir, 'opt.txt')
         else:
+            opt.name = opt.dataset + "/" + opt.model + "/" + opt.name
             expr_dir = os.path.join(opt.checkpoints_dir, opt.name)
             file_name = os.path.join(expr_dir, 'opt_eval.txt')
         with open(file_name, 'wt') as opt_file:

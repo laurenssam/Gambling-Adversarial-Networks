@@ -23,7 +23,7 @@ import pickle
 
 
 
-class CEModel(BaseModel):
+class ARGModel(BaseModel):
     """ This class implements the pix2pix model, for learning a mapping from input images to output images given paired data.
     The model training requires '--dataset_mode aligned' dataset.
     By default, it uses a '--netG unet256' U-Net generator,
@@ -47,15 +47,13 @@ class CEModel(BaseModel):
         parser.set_defaults(norm='batch', netG='unet_512', netD='unet', dataset_mode='aligned')
         if is_train:
             parser.set_defaults(pool_size=0, gan_mode='vanilla')
-            parser.add_argument('--lambda_GAN', type=float, default=0.25, help='weight for L1 loss')
-            parser.add_argument('--lambda_emb', type=float, default=0.25, help='weight for L1 loss')
+            parser.add_argument('--lambda_GAN', type=float, default=1.0, help='weight for L1 loss')
             parser.add_argument('--alpha', type=float, default=0.25, help='Coefficient for weighting')
             parser.add_argument('--smooth', type=float, default=0.02, help='smoothing for the betting map')
             parser.add_argument('--input', type=int, default=0, help='only input the rgb as input')
             parser.add_argument('--peaked', type=int, default=0, help='only input the rgb as input')
             parser.add_argument('--zero_prediction', type=int, default=0, help='train on both the rgb only and rgb + prediction')
             parser.add_argument('--interleave', type=int, default=0, help='train on the ce map')
-            parser.add_argument('--start_adv', type=int, default=3, help='train on the ce map')
 
         return parser
 
@@ -66,9 +64,9 @@ class CEModel(BaseModel):
         """
         BaseModel.__init__(self, opt)
         # specify the training losses you want to print out. The training/test scripts will call <BaseModel.get_current_losses>
-        self.loss_names = ['G_bet_loss', 'G_CE', 'G_emb', 'D_bet_loss', 'D_bet_loss_real', "D_real", "D_fake"]
+        self.loss_names = ['G_fake', 'G_CE', 'real', 'fake']
         # specify the images you want to save/display. The training/test scripts will call <BaseModel.get_current_visuals>
-        self.visual_names = ['real_A', 'real_B', 'fake_B_output', 'bet_map', 'ce_map', "prediction", "borders"]
+        self.visual_names = ['real_A', 'real_B', 'fake_B_output', 'bet_map', 'bet_map2']
         # specify the models you want to save to the disk. The training/test scripts will call <BaseModel.save_networks> and <BaseModel.load_networks>
         if self.isTrain:
             self.model_names = ['G', 'D']
@@ -76,57 +74,50 @@ class CEModel(BaseModel):
             self.model_names = ['G']
         # define networks (both generator and discriminator)
         self.netG = networks.define_G(opt.input_nc, opt.output_nc, opt.ngf, opt.netG, opt.norm,
-                                      not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids).to(self.device)
+                                      not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids)
         self.ignore = 255
-        self.n_classes = self.opt.output_nc
+        self.n_classes = 19
         self.opt = opt
-        if self.opt.adv:
-            output_nc = 2
-        else:
-            output_nc = 1
-        opt.init_type = "kaiming"
-        self.netD = networks.define_D(opt.input_nc + self.opt.output_nc, opt.ndf, opt.netD,
-                                opt.n_layers_D, opt.norm, opt.init_type, opt.init_gain, self.gpu_ids, output_nc).to(self.device)
+        output_nc = 1
+        opt.init_type = "xavier"
+        opt.init_gain = 0.25
+        self.opt.netD = "unet"
+        self.netD = networks.define_D(opt.input_nc + 1, opt.ndf, opt.netD,
+                                opt.n_layers_D, opt.norm, opt.init_type, opt.init_gain, self.gpu_ids, output_nc)
 
         self.BCEweight = torch.tensor([self.opt.weight_gambler]).to(self.device)
         self.criterionBCE = torch.nn.BCEWithLogitsLoss(pos_weight=self.BCEweight, reduction="none")
         self.criterionmatch = torch.nn.BCELoss()
-        if self.opt.adv:
-            self.criterionGAN = networks.GANLoss(opt.gan_mode).to(self.device)
-        self.criterionL1 =  torch.nn.L1Loss()
+        self.criterionGAN = networks.GANLoss(opt.gan_mode).to(self.device)
+
 
         self.softmax = torch.nn.Softmax(dim=1)
         self.sigmoid = torch.nn.Sigmoid()
+        print(self.netD)
 
         if self.isTrain:  # define a discriminator; conditional GANs need to take both input and output images; Therefore, #channels for D is input_nc + output_nc
             # state_dict = torch.load("latest_net_D.pth", map_location=self.device)
             # self.netD.load_state_dict(state_dict)
             # initialize optimizers; schedulers will be automatically created by function <BaseModel.setup>.
             self.optimizer_G = torch.optim.Adam(self.netG.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999), weight_decay=5e-4)
-            self.optimizer_D = torch.optim.Adam(self.netD.parameters(), lr=opt.lr_D, betas=(0.9, 0.999), weight_decay=1e-5)
+            self.optimizer_D = torch.optim.Adam(self.netD.parameters(), lr=opt.lr_D, betas=(0.9, 0.999))
             self.optimizers.append(self.optimizer_G)
             self.optimizers.append(self.optimizer_D)
 
             # Initalize loss functions
-            if self.opt.dataset == "voc":
-                self.weight = torch.tensor([1.59, 78.8, 89., 81.72, 113.67, 144., 57.9, 39.8, 25.62, 72.51, 133.7, 96., 27.4, 83.63, 67.7,  11.2, 137.6, 119.2, 80.3, 59., 111.]).to(self.device)
-            elif self.opt.dataset == "camvid":
-                self.weight = torch.tensor([0.588, 0.510, 2.6966, 0.45, 1.17, 0.770, 2.47, 2.52, 1.01, 3.237, 4.131]).to(self.device)
-            else:
-                self.weight = torch.tensor([2.5, 24.1, 4.9, 209.9, 151.4, 86.8, 498.4, 186.2, 6.1200, 113.6, 17.2, 82.9, 632.9, 16.9, 446.,411.5, 450.2, 1158.9, 274.6]).to(self.device)
+            self.weight = torch.tensor([2.5, 24.1, 4.9, 209.9, 151.4, 86.8, 498.4, 186.2, 6.12, 113.6, 17.2, 82.9, 632.9, 16.9, 446.,411.5, 450.2, 1158.9, 274.6]).to(self.device)
             self.criterionCE = torch.nn.CrossEntropyLoss(weight=self.weight**(self.opt.alpha), ignore_index=self.ignore) 
+            # self.criterionCE = FocalLoss2d(weight=self.weight**(0.25), gamma = 2)
+
+            # layers for output U-nets
 
             # Loading the generator        
             if opt.pretrained == "full":
-                filename = "latest_net_G_full_" + self.opt.dataset + "_" + self.opt.netG + ".pth" 
-                state_dict = torch.load(filename, map_location=self.device)
+                state_dict = torch.load("latest_net_G_full.pth", map_location=self.device)
                 self.netG.load_state_dict(state_dict)
-                print(filename + "loaded")
-            elif opt.pretrained == "early":
-                filename = "latest_net_G_early_" + self.opt.dataset + "_" + self.opt.netG + ".pth" 
-                state_dict = torch.load(filename, map_location=self.device)
+            elif opt.pretrained == "split":
+                state_dict = torch.load("latest_net_G_split.pth", map_location=self.device)
                 self.netG.load_state_dict(state_dict)
-                print(filename + "loaded")
             else:
                 print("Starting from scratch")
 
@@ -137,16 +128,11 @@ class CEModel(BaseModel):
             self.D_train = opt.D_train
             self.G_train = opt.G_train
             self.pretrain_D = opt.pretrain_D
-            self.loss_D_bet_loss_real = 0
-            self.loss_D_bet_loss = 0
             self.pretrain = self.pretrain_D > 0
-            self.loss_G_bet_loss = 0
+            self.loss_G_fake = 0
             self.loss_matching = 0
             self.loss_D_budget_loss = 0
-            self.loss_D_fake = 0
-            self.loss_D_real = 0
             self.loss_G_CE = 0
-            self.loss_G_emb = 0
             self.norms_G = []
             self.iteration_G = 0
             self.iteration_D = 0
@@ -159,25 +145,6 @@ class CEModel(BaseModel):
             if not os.path.exists("checkpoints/" + opt.name + "/gradients"):
                 os.mkdir("checkpoints/" + opt.name + "/gradients") 
 
-    # def interleave(self, image):
-    #     one_hot_real = self.real_B.clone()
-    #     one_hot_real[one_hot_real == self.ignore] = 0
-    #     one_hot_real = self.to_one_hot(one_hot_real.unsqueeze(dim=1), self.n_classes).float()
-    #     size = self.real_B.shape
-    #     # random_prediction = self.to_one_hot(torch.randint(0, self.n_classes, self.real_B.shape).unsqueeze(dim=1).to(self.device), self.n_classes)
-    #     random_prediction = image.clone().detach()
-    #     random_indices = np.arange(-1, image.shape[0]-1)
-    #     random_prediction = random_prediction[random_indices]
-    #     tile_mask = torch.zeros(size).to(self.device)
-    #     probs = torch.tensor([0.7, 0.15, 0.15])
-    #     for i in range(0, 512, self.tile_size):
-    #         for j in range(0, 512, self.tile_size):
-    #             tile_mask[:, i:i+self.tile_size, j:j+self.tile_size] = torch.multinomial(probs, size[0]).reshape((size[0], 1, 1)).expand(size[0], self.tile_size, self.tile_size)
-    #     tile_mask = tile_mask.unsqueeze(dim=1).expand(self.fake_B.shape)
-    #     image[tile_mask == 1] = one_hot_real[tile_mask == 1]
-    #     image[tile_mask == 2] = random_prediction[tile_mask == 2]
-    #     return image
-
     def set_input(self, input):
         """Unpack input data from the dataloader and perform necessary pre-processing steps.
         Parameters:
@@ -186,76 +153,51 @@ class CEModel(BaseModel):
         """
         self.real_A = input['A'].to(self.device)
         self.real_B = input['B'].to(self.device)
-        if self.opt.dataset == "voc":
-            self.borders = torch.zeros(self.real_B.shape).to(self.device).float()
-        else:
-            if self.netG.training:
-                self.borders = input['C'].to(self.device).float()
+        self.borders = input['C'].to(self.device).float()
         self.image_paths = input['A_paths']
 
     def forward(self):
         """Run forward pass; called by both functions <optimize_parameters> and <test>."""
-        self.fake_B = self.netG(self.real_A)  # G(A) # Forward pass      
-
-        # One-hot of argmax fake
-        if self.netG.training:
-            self.fake_B_masked = self.to_one_hot(torch.argmax(self.fake_B.clone().detach(), dim=1).unsqueeze(dim=1), self.n_classes)
-
-            if self.opt.adv:
-                # One-hot of real 
-                self.real_B_masked = self.real_B.clone()
-                self.real_B_masked[self.real_B_masked == self.ignore] = 0
-                self.real_B_masked = self.to_one_hot(self.real_B_masked.unsqueeze(dim=1), self.n_classes)  
+        self.fake_B = self.netG(self.real_A)  # G(A) # Forward pass        
 
     def forward_D(self, input_D, zero_pred=False, zero_rgb=False, channel=False, gen=False):
-        # Masking out the ignore class
         self.mask = (self.real_B != self.ignore).unsqueeze(dim=1).expand(self.fake_B.shape).float() # mask for ignore class  
         input_D = (input_D * self.mask) - (1 - self.mask)
-        if self.opt.adv:
-            input_D_real = (self.real_B_masked * self.mask) - (1 - self.mask)
 
-        # Either concatenate with rgb or "Nothing"
         if zero_rgb:
             fake_AB = torch.cat((torch.zeros(self.real_A.shape).to(self.device), input_D), 1) 
         else:
             fake_AB = torch.cat((self.real_A, input_D), 1)  # concat input rgb + masked output
-        
-        # Do a forward pass
-        if self.opt.adv:
-            prediction_D = self.netD(fake_AB)
 
-            # First channel is betting map, second adversarial map
-            adversarial_output = prediction_D[:, 1] 
-            output_gambler = prediction_D[:, 0]
-        else:
-            output_gambler = self.netD(fake_AB).squeeze(dim=1)
+        output_gambler = self.netD(fake_AB)
+        match = self.sigmoid(output_gambler[:, 1]) # matching channel
+        output_gambler = output_gambler[:, 0] ## Bet map
 
-        # Zeroed out pred
         if zero_pred:
             self.errors = (torch.argmax(self.fake_B, dim=1) != self.real_B).float() * (self.real_B != self.ignore).float()
-            loss_bet = torch.mean(self.criterionBCE(output_gambler, self.errors) * (1-self.borders))
-        # Forward pass if the generator gets updated
+            loss_bet = torch.mean(self.criterionBCE(output_gambler.squeeze(dim=1), self.errors) * (1-self.borders))
         elif gen:
             self.prediction = input_D
             self.errors = (torch.argmax(input_D, dim=1) != self.real_B).float() * (self.real_B != self.ignore).float()
-            # loss_bet = -torch.mean(self.criterionBCE(output_gambler, self.errors))
-            loss_bet = torch.mean(torch.log(self.sigmoid(output_gambler) + 1e-8))
-            # self.loss_G_emb = self.criterionGAN(adversarial_output, True)
-
-            # loss_bet = torch.mean(self.criterionBCE(output_gambler.squeeze(dim=1), 1 - self.errors))
+            loss_bet = -torch.mean(self.criterionBCE(output_gambler.squeeze(dim=1), self.errors))
         else:
-            
+            self.prediction = input_D
             self.errors = (torch.argmax(input_D, dim=1) != self.real_B).float() * (self.real_B != self.ignore).float()
-            loss_bet = torch.mean(self.criterionBCE(output_gambler, self.errors) * (1-self.borders))  #self.criterionMSE(output_gambler, errors)
-            # Real
-            if self.netD.training and self.opt.adv:
-                self.loss_D_fake = self.criterionGAN(adversarial_output, False)
-                real_AB = torch.cat((self.real_A, input_D_real), 1)
-                prediction_D_real = self.netD(real_AB)
-                adversarial_output_real = prediction_D_real[:, 1]
-                output_gambler_real = prediction_D_real[:, 0]
-                self.loss_D_real = self.criterionGAN(adversarial_output_real, True)
-                self.loss_D_bet_loss_real = torch.mean(self.criterionBCE(output_gambler_real, torch.zeros(output_gambler.shape).to(self.device)))  #self.criterionMSE(output_gambler, errors)
+            loss_bet = torch.mean(self.criterionBCE(output_gambler.squeeze(dim=1), self.errors) * (1-self.borders))  #self.criterionMSE(output_gambler, errors)
+            if channel and self.opt.matching:
+                size = match.shape
+                label = torch.ones(match.shape).to(self.device) * self.match_label
+                loss_matching = self.criterionmatch(match, label)
+                prediction = torch.mean(match.reshape(size[0], -1), dim=1) > 0.5
+                target = (torch.ones(size[0]).byte() * self.match_label).to(self.device)
+                self.correct.append((prediction == target).sum().item())
+                self.total.append(size[0])
+                self.bet_map2 = match.clone().detach()
+                if len(self.correct) > 100:
+                    self.accuracy_matching.append(sum(self.correct)/sum(self.total))
+                    del self.correct[0]
+                    del self.total[0]
+                return output_gambler, loss_bet, loss_matching
         return output_gambler, loss_bet
 
     def to_one_hot(self, labels, C):
@@ -266,13 +208,13 @@ class CEModel(BaseModel):
     def hist_gradient(self, parameters, name_model):
         counter = 0
         store = []
-        for _ , p in parameters:
+        for name , p in parameters:
             if len(p.shape) > 3:
                 store.append(("conv" + str(counter) + "_" + str(p.shape), p.flatten().cpu().data))
                 counter += 1
         fig, ax = plt.subplots(nrows=6, ncols=3, figsize=(15,15), constrained_layout=True)
         counter = 0
-        if name_model == "G":
+        if name == "G":
             img_path = "checkpoints/" + self.opt.name + "/gradients/histogram_iter" + str(self.iteration_G) + "_" + name_model + ".png"
         else:
             img_path = "checkpoints/" + self.opt.name + "/gradients/histogram_iter" + str(self.iteration_D) + "_" + name_model + ".png"
@@ -285,71 +227,101 @@ class CEModel(BaseModel):
         plt.savefig(img_path, dpi=100)
         plt.close()
 
+    def shuffle_input(self):
+        size = self.fake_B.shape
+        if np.random.uniform() > 0.5:
+            self.match_label = 0 # Not matching
+            self.real_A = self.real_A[np.arange(-1, size[0] - 1)]
+        else:
+            self.match_label = 1 # Are matching
+
+    def normalize_data(self, inp):
+        out = (inp - - 1)/((self.n_classes - 1) - -1)
+        # out = (inp - torch.mean(inp))/torch.std(inp)
+        return out
+
     def backward_D(self):
         """Calculate GAN loss for the discriminator"""
         # Fake; stop backprop to the generator by detaching fake_B
         # Train with fake or add ground-truth
-        self.prediction = input_D = self.fake_B_masked
-        self.optimizer_D.zero_grad()     # set D's gradients to zero
-        # Detach forward pass G from the graph
-        output_gambler, self.loss_D_bet_loss = self.forward_D(self.fake_B_masked.detach())
-        if self.opt.adv:
-            self.loss_D = self.loss_D_bet_loss + self.loss_D_fake + self.loss_D_real + self.loss_D_bet_loss_real
-        else:
-            self.loss_D = self.loss_D_bet_loss
-        self.loss_D_bet_loss.backward()
-        self.optimizer_D.step()         
-        self.ce_map = self.errors
+        # self.fake_B_masked = self.to_one_hot(torch.argmax(self.fake_B.clone().detach(), dim=1).unsqueeze(dim=1), self.n_classes)
+        self.fake_B_masked = torch.argmax(self.fake_B.clone().detach(), dim=1)
 
-        if not self.opt.adv:
-            self.real_B_masked = self.real_B.clone()
-            self.real_B_masked[self.real_B_masked == self.ignore] = 0
-            self.real_B_masked = self.to_one_hot(self.real_B_masked.unsqueeze(dim=1), self.n_classes) 
+        # self.fake_B_masked = ((1 - self.fake_B_masked) * -self.softmax(self.fake_B.detach())) + (self.fake_B_masked - (self.fake_B_masked * self.softmax(self.fake_B.detach())))
+        # self.fake_B_masked = self.softmax(self.fake_B) + self.fake_B_masked
+        # class_ids = torch.arange(19).reshape(19, 1, 1,).expand(19, 512, 512).to(self.device)
+        # batch_class_ids = torch.stack([class_ids for i in range(self.fake_B_masked.shape[0])]).float()
+        # self.fake_B_masked = torch.sum(self.fake_B_masked * batch_class_ids, dim=1)
+        mask = (self.real_B != self.ignore).float() # mask for ignore class 
+        self.real_B_masked = (self.real_B.float() * mask) - (1 - mask) 
+        self.fake_B_masked = (self.fake_B_masked.float() * mask) - (1 - mask) 
+        self.fake_B_norm = self.normalize_data(self.fake_B_masked)
+        self.real_B_norm = self.normalize_data(self.real_B_masked.float())
 
-        if np.random.uniform() > 0.75:
-            self.optimizer_D.zero_grad()     # set D's gradients to zero
-            # Detach forward pass G from the graph
-            output_gambler, self.loss_D_bet_loss_real = self.forward_D(self.real_B_masked.detach())
-            self.loss_D_bet_loss_real.backward()
-            self.optimizer_D.step()  
 
-        self.loss_D_bet_loss_zero = 0
-        if self.opt.zero_prediction: #and not self.epoch < 2:
-            self.optimizer_D.zero_grad()
-            output_gambler_zero, self.loss_D_bet_loss_zero = self.forward_D(torch.zeros(self.fake_B.shape).to(self.device), zero_pred=True)
-            self.loss_D = self.loss_D_bet_loss_zero
-            self.loss_D.backward()
-            self.optimizer_D.step() 
-            self.bet_map2 = self.sigmoid(output_gambler_zero).squeeze(dim=1)
+        self.optimizer_D.zero_grad()
+        fake_AB = torch.cat((self.real_A, self.fake_B_norm.unsqueeze(dim=1)), 1)  # we use conditional GANs; we need to feed both input and output to the discriminator
+        pred_fake = self.netD(fake_AB).squeeze()
+        self.loss_fake = self.criterionGAN(pred_fake, False)
 
-        # if self.iteration_D % 100 == 0:
-        #     self.hist_gradient(list(self.netD.named_parameters()), "D")
+        # Real
+        real_AB = torch.cat((self.real_A, self.real_B_norm.unsqueeze(dim=1)), 1)
+        pred_real = self.netD(real_AB).squeeze()
+
+        self.loss_real = self.criterionGAN(pred_real, True)
+         
+        # combine loss and calculate gradients
+        self.loss_D = (self.loss_fake + self.loss_real) * 0.5
+        self.loss_D.backward()
+        self.optimizer_D.step()
+        # self.ce_map = self.errors
+
+        if self.iteration_D % 100 == 0:
+            self.hist_gradient(list(self.netD.named_parameters()), "D")
 
         self.iteration_D += 1
-        self.bet_map = self.sigmoid(output_gambler).squeeze(dim=1)
+        self.bet_map = self.sigmoid(pred_fake).squeeze(dim=1)
+        self.bet_map2 = self.sigmoid(pred_real).squeeze(dim=1)
 
     
     def backward_G(self):
         """Calculate GAN and L1 loss for the generator"""
         # First, G(A) should fake the discriminator
-        output_gambler, self.loss_G_bet_loss  = self.forward_D(self.softmax(self.fake_B + (self.fake_B_masked.detach() * 3)), gen=True) # N X 1 X 512 X 512, training discr
+        self.fake_B_masked = self.to_one_hot(torch.argmax(self.fake_B.clone().detach(), dim=1).unsqueeze(dim=1), self.n_classes)
+        self.fake_B_masked = ((1 - self.fake_B_masked) * -self.softmax(self.fake_B.detach())) + (self.fake_B_masked - (self.fake_B_masked * self.softmax(self.fake_B.detach())))
+        self.fake_B_masked = self.softmax(self.fake_B) + self.fake_B_masked
+        class_ids = torch.arange(19).reshape(19, 1, 1,).expand(19, 512, 512).to(self.device)
+        batch_class_ids = torch.stack([class_ids for i in range(self.fake_B_masked.shape[0])]).float()
+        self.fake_B_masked = torch.sum(self.fake_B_masked * batch_class_ids, dim=1)
+        mask = (self.real_B != self.ignore).float() # mask for ignore class 
+        self.real_B_masked = (self.real_B.float() * mask) - (1 - mask) 
+        self.fake_B_masked = (self.fake_B_masked.float() * mask) - (1 - mask) 
+        self.fake_B_norm = self.normalize_data(self.fake_B_masked)
+        self.real_B_norm = self.normalize_data(self.real_B_masked.float())
 
+
+        self.optimizer_D.zero_grad()
+        fake_AB = torch.cat((self.real_A, self.fake_B_norm.unsqueeze(dim=1)), 1)  # we use conditional GANs; we need to feed both input and output to the discriminator
+        pred_fake = self.netD(fake_AB).squeeze()
+        self.loss_G_fake = self.criterionGAN(pred_fake, True)
         self.loss_G_CE = self.criterionCE(self.fake_B, self.real_B) # Backpropgate through Cross Entropy here
-        if self.epoch < self.opt.start_adv and self.opt.pretrained == "scratch":
-            self.loss_G = self.loss_G_CE
-        else:
-            self.loss_G = self.opt.lambda_GAN * self.loss_G_bet_loss  + self.loss_G_CE 
+        self.loss_G = self.loss_G_fake + self.loss_G_CE
         self.loss_G.backward()
-        self.bet_map = self.sigmoid(output_gambler)
-        # if self.iteration_G % 100 == 0:
-        #     self.hist_gradient(list(self.netG.named_parameters()), "G")
+        total_norm = 0
+        for p in self.netG.parameters():
+            param_norm = p.grad.data.norm(2)
+            total_norm += param_norm.item() ** 2
+        total_norm = total_norm ** (1. / 2)
+        self.norms_G.append(float(total_norm))
+        if self.iteration_G % 25 == 0:
+            self.hist_gradient(list(self.netG.named_parameters()), "G")
         self.iteration_G += 1
-        self.ce_map = self.errors
         
     def optimize_parameters(self):
         # compute fake images: G(A)
         self.forward() 
         if self.pretrain == True:
+            self.set_requires_grad(self.netD, True)  # enable backprop for D
             self.backward_D()                # calculate gradients for D
             self.count_D += 1
             who_trains = "pre_D"
@@ -384,6 +356,18 @@ class CEModel(BaseModel):
         # if self.opt.matching:
         #     self.interleaved = torch.argmax(self.fake_B_masked[0].unsqueeze(dim=0), dim=1)
         #     self.interleaved[(self.real_B[0] == self.ignore).unsqueeze(dim=0)] = self.real_B[0][self.real_B[0] == self.ignore].unsqueeze(dim=0)
+
+        if self.count_G > 0 and self.count_G % 100 == 0:
+            plt.plot(self.norms_G)
+            plt.title("Gradient norm G")
+            plt.savefig("checkpoints/" + self.opt.name + "/norm_G.png")
+            plt.close()
+
+        if self.count_D > 0 and self.count_D % 25 == 0 and self.opt.matching:
+            plt.plot(self.accuracy_matching)
+            plt.title("Accuracy matching")
+            plt.savefig("checkpoints/" + self.opt.name + "/matching.png")
+            plt.close()
         self.netG.train()
         total = 0
         return who_trains

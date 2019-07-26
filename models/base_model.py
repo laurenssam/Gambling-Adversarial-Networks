@@ -36,6 +36,7 @@ class BaseModel(ABC):
         self.save_dir = os.path.join(opt.checkpoints_dir, opt.name)  # save all the checkpoints to save_dir
         if opt.preprocess != 'scale_width':  # with [scale_width], input images might have different sizes, which hurts the performance of cudnn.benchmark.
             torch.backends.cudnn.benchmark = True
+
         self.loss_names = []
         self.model_names = []
         self.visual_names = []
@@ -116,7 +117,10 @@ class BaseModel(ABC):
     def update_learning_rate(self):
         """Update learning rates for all the networks; called at the end of every epoch"""
         for scheduler in self.schedulers:
-            scheduler.step()
+            if self.opt.lr_policy == "plateau":
+                scheduler.step(self.valloss)
+            else:
+                scheduler.step()
         lr = self.optimizers[0].param_groups[0]['lr']
         print('learning rate = %.7f' % lr)
 
@@ -147,7 +151,10 @@ class BaseModel(ABC):
                 save_filename = '%s_net_%s.pth' % (epoch, name)
                 save_path = os.path.join(self.save_dir, save_filename)
                 net = getattr(self, 'net' + name)
-
+                if name == "G":
+                    save_filename_opt = '%s_net_%s_opt.pth' % (epoch, name)
+                    save_path_opt = os.path.join(self.save_dir, save_filename_opt)
+                    torch.save(self.optimizer_G.state_dict(), save_path_opt)
                 if len(self.gpu_ids) > 0 and torch.cuda.is_available():
                     torch.save(net.cpu().state_dict(), save_path)
                     net.cuda(self.gpu_ids[0])

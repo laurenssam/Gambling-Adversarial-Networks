@@ -189,7 +189,7 @@ class Visualizer():
                     img_path = os.path.join(self.img_dir, 'epoch%.3d_iter%.3d_%s_prediction.png' % (epoch, iteration + 1, trainer))
                     for row in ax:
                         for col in row:
-                            if counter == 19:
+                            if counter >= image_numpy.shape[0]:
                                 col.set_visible(False)
                             else:
                                 temp = col.imshow(image_numpy[counter], cmap = 'hot')

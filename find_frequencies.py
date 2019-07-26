@@ -1,4 +1,22 @@
+import time
+from options.train_options import TrainOptions
+from data import create_dataset
+from models import create_model
+from util.visualizer import Visualizer
+import torch
+from util.util import *
 import cityscapes
+import voc
+import camvid
+from torch.utils.data import DataLoader
+import scipy.misc
+from cityscapes import colorize_mask, calculate_stats, plot_stats, calculate_weight_vector, plot_gambler, plot_G
+from sklearn.metrics import confusion_matrix 
+import pickle
+import os.path
+import torchvision
+import copy
+import camvid
 import cv2
 from torch.utils.data import DataLoader
 import numpy as np
@@ -14,7 +32,6 @@ for j, data in enumerate(train_loader):
 	if j % 25 == 0 and j > 0:
 		print(j)
 	label = data[1].squeeze().float() + 1
-	# color_label = cityscapes.visualize(cityscapes.colorize_mask(label.numpy()).convert("RGB"))
 	frequency_per_label = []
 	for i in range(1, cityscapes.num_classes + 1):
 		mask = (label == i).float()

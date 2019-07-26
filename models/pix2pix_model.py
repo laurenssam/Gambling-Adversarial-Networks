@@ -67,7 +67,7 @@ class Pix2PixModel(BaseModel):
         self.model_names = ['G']
         # define networks (both generator and discriminator)
         self.netG = networks.define_G(opt.input_nc, opt.output_nc, opt.ngf, opt.netG, opt.norm,
-                                      not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids)
+                                      not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids).to(self.device)
 
         if self.isTrain:  # define a discriminator; conditional GANs need to take both input and output images; Therefore, #channels for D is input_nc + output_nc
             for i in range(1, self.opt.num_D + 1):
@@ -79,7 +79,7 @@ class Pix2PixModel(BaseModel):
                 setattr(self, 'loss_D' + str(i) +'_fake', 0)
                 setattr(self, 'loss_D' + str(i) +'_real', 0)
                 # self.optimizers.append(torch.optim.SGD(temp.parameters(), lr=opt.lr_D, momentum=0.9))
-                self.optimizers.append(torch.optim.Adam(temp.parameters(), lr=opt.lr_D, betas=(opt.beta1, 0.999)))
+                self.optimizers.append(torch.optim.Adam(temp.parameters(), lr=opt.lr_D, betas=(opt.beta1, 0.999), weight_decay=1e-5))
                 self.model_names.extend(['D' + str(i)])
 
             self.downsample = torch.nn.AvgPool2d(3, stride=2, padding=[1, 1], count_include_pad=False)
@@ -88,10 +88,17 @@ class Pix2PixModel(BaseModel):
         if self.isTrain:
             self.ignore = 255
             # define loss functions
-            self.weight = torch.tensor([2.5, 24.1, 4.9, 209.9, 151.4, 86.8, 498.4, 186.2, 6.1200, 113.6, 17.2, 82.9, 632.9, 16.9, 446.,411.5, 450.2, 1158.9, 274.6]).to(self.device)
+            if self.opt.dataset == "voc":
+                self.weight = torch.tensor([1.59, 78.8, 89., 81.72, 113.67, 144., 57.9, 39.8, 25.62, 72.51, 133.7, 96., 27.4, 83.63, 67.7,  11.2, 137.6, 119.2, 80.3, 59., 111.]).to(self.device)
+            elif self.opt.dataset == "camvid":
+                self.weight = torch.tensor([0.588, 0.510, 2.6966, 0.45, 1.17, 0.770, 2.47, 2.52, 1.01, 3.237, 4.131]).to(self.device)
+            else:
+                self.weight = torch.tensor([2.5, 24.1, 4.9, 209.9, 151.4, 86.8, 498.4, 186.2, 6.1200, 113.6, 17.2, 82.9, 632.9, 16.9, 446.,411.5, 450.2, 1158.9, 274.6]).to(self.device)
 
             # self.criterionCE = FocalLoss2d(weight=self.weight**(opt.alpha), gamma=opt.gamma)
             self.criterionCE = torch.nn.CrossEntropyLoss(weight=self.weight**(opt.alpha), ignore_index=self.ignore)  
+            # self.criterionCE = torch.nn.CrossEntropyLoss( ignore_index=self.ignore)  
+
             # self.criterionCE = FocalLoss2d(weight=self.weight**(0.25), gamma = 2)
           
             self.criterionGAN = networks.GANLoss(opt.gan_mode).to(self.device)
@@ -113,17 +120,18 @@ class Pix2PixModel(BaseModel):
             self.loss_G_GAN = 0
             self.loss_G_CE = 0
             if opt.pretrained == "full":
-                state_dict = torch.load("latest_net_G_full.pth", map_location=self.device)
+                filename = "latest_net_G_full_" + self.opt.dataset + "_" + self.opt.netG + ".pth" 
+                state_dict = torch.load(filename, map_location=self.device)
                 self.netG.load_state_dict(state_dict)
-            elif opt.pretrained == "split":
-                state_dict = torch.load("latest_net_G_split.pth", map_location=self.device)
+                print(filename + "loaded")
+            elif opt.pretrained == "early":
+                filename = "latest_net_G_early_" + self.opt.dataset + "_" + self.opt.netG + ".pth" 
+                state_dict = torch.load(filename, map_location=self.device)
                 self.netG.load_state_dict(state_dict)
+                print(filename + "loaded")
             else:
                 print("Starting from scratch")
-            # state_dict_opt = torch.load("optimizer.pth")
-            # self.optimizer_G.load_state_dict(state_dict_opt)
-            # self.optimizer_G.param_groups[0]["lr"] = opt.lr
-            # print(self.optimizer_G)
+   
 
             self.softmax = torch.nn.Softmax(dim=1)
             self.sigmoid = torch.nn.Sigmoid()
@@ -149,9 +157,9 @@ class Pix2PixModel(BaseModel):
     def forward(self):
         """Run forward pass; called by both functions <optimize_parameters> and <test>."""
         self.fake_B = self.netG(self.real_A)  # G(A) ## Convolution output N X 19 X 512 X 512
-        valid_region_mask = (self.real_B != self.ignore).unsqueeze(1).expand(self.fake_B.shape).float() ## N X 19 X 512 X 512 0 for where real is ignore label
-        self.input_discr_fake = self.softmax(self.fake_B) * valid_region_mask ## Elementwise multiplication: Zeroing out the ignore label
-        self.mean_max.append(torch.mean(torch.max(self.softmax(self.fake_B), dim=1)[0]).data)
+        if self.netG.training:
+            valid_region_mask = (self.real_B != self.ignore).unsqueeze(1).expand(self.fake_B.shape).float() ## N X 19 X 512 X 512 0 for where real is ignore label
+            self.input_discr_fake = self.softmax(self.fake_B) * valid_region_mask ## Elementwise multiplication: Zeroing out the ignore label
 
     
     def to_one_hot(self, labels, C):
@@ -167,7 +175,7 @@ class Pix2PixModel(BaseModel):
         # Fake; stop backprop to the generator by detaching fake_B
         self.real_B_one_hot_temp = self.real_B.clone() ## cloning the real image
         self.real_B_one_hot_temp[self.real_B_one_hot_temp == self.ignore] = 0 ## Replacing ignore label by zeroes
-        self.real_B_one_hot = self.to_one_hot(self.real_B_one_hot_temp.unsqueeze(dim=1), 19) ## convert to one-hot
+        self.real_B_one_hot = self.to_one_hot(self.real_B_one_hot_temp.unsqueeze(dim=1), self.opt.output_nc) ## convert to one-hot
         valid_region_mask = (self.real_B != self.ignore).unsqueeze(1).expand(self.real_B_one_hot.shape).float() ## see forward(self)
         self.real_B_one_hot = self.real_B_one_hot * valid_region_mask
 
@@ -198,17 +206,7 @@ class Pix2PixModel(BaseModel):
             self.loss_D = (loss_fake + loss_real) * 0.5
             self.loss_D.backward()
             self.optimizers[i-1].step()
-            total_norm = 0
-            for p in self.netD1.parameters():
-                param_norm = p.grad.data.norm(2)
-                total_norm += param_norm.item() ** 2
-            total_norm = total_norm ** (1. / 2)
-            self.norms_D.append(float(total_norm))
 
-
-            correct_predictions = (self.sigmoid(pred_fake) < 0.5).float().sum()
-            correct_predictions += (self.sigmoid(pred_real) > 0.5).float().sum()
-            self.accuracies.append(float(correct_predictions/(np.prod(pred_fake.shape) * 2)))
             setattr(self, 'loss_D' + str(i) + '_fake', loss_fake.item())
             setattr(self, 'loss_D' + str(i) + '_real', loss_real.item())
 
@@ -239,12 +237,6 @@ class Pix2PixModel(BaseModel):
         self.loss_G.backward()
         self.optimizer_G.step()
 
-        total_norm = 0
-        for p in self.netG.parameters():
-            param_norm = p.grad.data.norm(2)
-            total_norm += param_norm.item() ** 2
-        total_norm = total_norm ** (1. / 2)
-        self.norms_G.append(float(total_norm))
 
 
     def optimize_parameters(self):
@@ -271,25 +263,6 @@ class Pix2PixModel(BaseModel):
                     self.count_G = 0
                     print("Finished schedule D: training mode")
 
-        plt.plot(self.accuracies)
-        plt.title("Accuracy discriminator")
-        plt.savefig("checkpoints/" + self.opt.name + "/accuracy.png")
-        plt.close()
-
-        plt.plot(self.norms_D)
-        plt.title("Gradient norm D")
-        plt.savefig("checkpoints/" + self.opt.name + "/norm_D.png")
-        plt.close()
-
-        plt.plot(self.norms_G)
-        plt.title("Gradient norm G")
-        plt.savefig("checkpoints/" + self.opt.name + "/norm_G.png")
-        plt.close()
-
-        plt.plot(self.mean_max)
-        plt.title("mean of the max prediction")
-        plt.savefig("checkpoints/" + self.opt.name + "/mean_max.png")
-        plt.close()
-        self.fake_B_output = torch.argmax(self.fake_B.clone(), dim=1)   ## N X 512 x 512
+        self.fake_B_output = torch.argmax(self.fake_B.detach(), dim=1)   ## N X 512 x 512
         self.fake_B_output[self.real_B == self.ignore] = self.real_B[self.real_B == self.ignore]
 
